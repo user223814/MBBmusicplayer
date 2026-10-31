@@ -812,12 +812,15 @@ class MusicPlayer(ctk.CTk):
         field.pack(fill="x", padx=16, pady=(22, 16))
         field.pack_propagate(False)
         ctk.CTkLabel(field, text="", image=self.icon("search", 14, C.SUB), width=28).pack(side="left", padx=(8, 0))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.on_search())
+        
         self.search_entry = ctk.CTkEntry(
             field, placeholder_text="Search", border_width=0, fg_color="transparent",
-            text_color=C.TEXT, placeholder_text_color=C.SUB, font=F(13), height=30
+            text_color=C.TEXT, placeholder_text_color=C.SUB, font=F(13), height=30,
+            textvariable=self.search_var
         )
         self.search_entry.pack(side="left", fill="both", expand=True, padx=(0, 6))
-        self.search_entry.bind("<KeyRelease>", self.on_search)
 
         # library section
         ctk.CTkLabel(
