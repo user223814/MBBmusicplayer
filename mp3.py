@@ -2,6 +2,7 @@ import os
 import io
 import sys
 import json
+import zhconv
 import math
 import queue
 import random
@@ -268,6 +269,7 @@ class MusicPlayer(ctk.CTk):
         self.rows = {}              # path -> row widgets
         self.favorites = []
         self.hidden_tracks = []
+        self.playlists = {}
         self.last_folder = ""
         self.settings_file = "player_settings.json"
 
@@ -369,6 +371,17 @@ class MusicPlayer(ctk.CTk):
             sb, text="", image=self.ph_big, fg_color="transparent", width=210, height=210
         )
         self.side_art.pack(side="bottom", pady=(0, 22))
+
+        ctk.CTkLabel(self.sidebar, text="Playlists", font=F(12, "bold"), text_color=C.DIM, anchor="w", height=20).pack(fill="x", padx=22, pady=(15, 4))
+        
+        ctk.CTkButton(
+            self.sidebar, text="  + New Playlist", anchor="w", height=30, corner_radius=8, 
+            fg_color="transparent", hover_color="#323234", text_color=C.TEXT, font=F(13),
+            command=self.create_playlist
+        ).pack(fill="x", padx=12, pady=1)
+        
+        self.playlist_container = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent", corner_radius=0, scrollbar_button_color="#3A3A3C")
+        self.playlist_container.pack(fill="both", expand=True, padx=4, pady=4)
 
         self.update_nav_highlight()
 
@@ -596,11 +609,17 @@ class MusicPlayer(ctk.CTk):
                 self.volume = float(data.get("volume", 0.8))
                 self.shuffle = bool(data.get("shuffle", False))
                 self.repeat = int(data.get("repeat", 0))
+                # --- 核心读取：获取上次保存的歌单 ---
+                self.playlists = data.get("playlists", {}) 
             except Exception:
                 pass
 
         self.apply_volume(self.volume)
         self.update_mode_buttons()
+        
+        # --- 核心UI渲染：程序一启动就把歌单刷到左侧边栏 ---
+        if hasattr(self, "refresh_sidebar_playlists"):
+            self.refresh_sidebar_playlists()
 
         if self.last_folder and os.path.isdir(self.last_folder):
             self.scan_folder(self.last_folder)
@@ -616,6 +635,8 @@ class MusicPlayer(ctk.CTk):
                 "volume": self.volume,
                 "shuffle": self.shuffle,
                 "repeat": self.repeat,
+                # --- 核心保存：把当前所有的歌单写进 JSON 文件存进硬盘 ---
+                "playlists": getattr(self, "playlists", {}),
             }
             with open(self.settings_file, "w") as f:
                 json.dump(data, f)
@@ -699,15 +720,43 @@ class MusicPlayer(ctk.CTk):
 
     def refresh_view(self, reset_scroll=False):
         items = self.tracks
+        
+        # 1. 列表内容过滤 (Favorites 和 Playlist 的逻辑完全独立)
         if self.view == "favorites":
             items = [t for t in items if t["path"] in self.favorites]
+        elif self.view.startswith("playlist_"):
+            p_name = self.view.replace("playlist_", "", 1)
+            items = [t for t in items if t["path"] in self.playlists.get(p_name, [])]
+            
+        # 2. 搜索过滤 (支持简繁体无缝互搜)
         q = self.search_query.lower()
         if q:
-            items = [t for t in items
-                     if q in t["title"].lower() or q in t["artist"].lower() or q in t["album"].lower()]
+            # 将用户的搜索词在后台转成简体
+            q_simp = zhconv.convert(q, 'zh-hans')
+            
+            filtered_items = []
+            for t in items:
+                # 把歌曲的标题、歌手、专辑也都暂时转成简体来进行匹配判断
+                title_simp = zhconv.convert(t["title"].lower(), 'zh-hans')
+                artist_simp = zhconv.convert(t["artist"].lower(), 'zh-hans')
+                album_simp = zhconv.convert(t["album"].lower(), 'zh-hans')
+                
+                # 只要有一项匹配中，就显示这首歌
+                if q_simp in title_simp or q_simp in artist_simp or q_simp in album_simp:
+                    filtered_items.append(t)
+            
+            items = filtered_items
 
         self.queue = [t["path"] for t in items]
-        self.title_label.configure(text="Favorites" if self.view == "favorites" else "Songs")
+        
+        # 3. 动态修改页面大标题
+        if self.view == "favorites":
+            self.title_label.configure(text="Favorites")
+        elif self.view.startswith("playlist_"):
+            self.title_label.configure(text=self.view.replace("playlist_", "", 1))
+        else:
+            self.title_label.configure(text="Songs")
+            
         self.subtitle_label.configure(text="Loading…" if self.loading else summarize(items))
         self.render_rows(items)
         if reset_scroll:
@@ -901,6 +950,13 @@ class MusicPlayer(ctk.CTk):
         else:
             menu.add_command(label="Add to Favorites", command=lambda: self.toggle_favorite(path))
         menu.add_separator()
+
+        if self.playlists:
+            playlist_menu = tk.Menu(menu, tearoff=0, bg="#2C2C2E", fg="white", activebackground=C.ACCENT, font=F(11))
+            for p_name in self.playlists.keys():
+                playlist_menu.add_command(label=p_name, command=lambda n=p_name: self.add_to_playlist(path, n))
+            menu.add_cascade(label="Add to Playlist ➔", menu=playlist_menu)
+        # ------------------------------------------
         menu.add_command(label="Remove from Library", command=lambda: self.remove_track_from_app(path))
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1181,6 +1237,59 @@ class MusicPlayer(ctk.CTk):
             pass
         self.play_pause_track()
         return "break"
+
+    # ========================================================
+    #  Playlist Core Logic
+    # ========================================================
+    def create_playlist(self):
+        dialog = ctk.CTkInputDialog(text="Enter Playlist Name:", title="New Playlist")
+        name = dialog.get_input()
+        if name and name.strip():
+            name = name.strip()
+            if name in self.playlists:
+                messagebox.showwarning("Exists", "Playlist already exists!")
+                return
+            self.playlists[name] = []
+            self.save_session()
+            self.refresh_sidebar_playlists()
+
+    def add_to_playlist(self, path, playlist_name):
+        if path not in self.playlists[playlist_name]:
+            self.playlists[playlist_name].append(path)
+            self.save_session()
+            # 如果用户正停留在该歌单界面，即时刷新显示新歌
+            if self.view == f"playlist_{playlist_name}":
+                self.refresh_view(reset_scroll=False)
+
+    def refresh_sidebar_playlists(self):
+        if not hasattr(self, "playlist_container"): return
+        for w in self.playlist_container.winfo_children():
+            w.destroy()
+            
+        for p_name in self.playlists.keys():
+            btn = ctk.CTkButton(
+                self.playlist_container, text=f"🎵  {p_name}", anchor="w", height=30, corner_radius=8,
+                fg_color=C.FIELD if self.view == f"playlist_{p_name}" else "transparent",
+                hover_color="#323234", text_color=C.TEXT, font=F(13),
+                command=lambda n=p_name: self.set_playlist_view(n)
+            )
+            btn.pack(fill="x", padx=8, pady=1)
+            # 隐藏彩蛋：对着左侧的歌单名字 Right-Click 可以删除整个歌单
+            btn.bind("<Button-3>", lambda e, n=p_name: self.delete_playlist(n))
+
+    def set_playlist_view(self, playlist_name):
+        self.view = f"playlist_{playlist_name}"
+        self.update_nav_highlight()
+        self.refresh_sidebar_playlists()
+        self.refresh_view(reset_scroll=True)
+
+    def delete_playlist(self, playlist_name):
+        if messagebox.askyesno("Delete Playlist", f"Are you sure you want to delete playlist '{playlist_name}'?"):
+            del self.playlists[playlist_name]
+            if self.view == f"playlist_{playlist_name}":
+                self.set_view("songs")
+            self.save_session()
+            self.refresh_sidebar_playlists()
 
 
 if __name__ == "__main__":
