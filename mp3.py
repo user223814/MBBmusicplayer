@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import sys
 import json
 import zhconv
@@ -11,7 +12,7 @@ import yt_dlp
 import tkinter as tk
 import customtkinter as ctk
 import pygame
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 from mutagen import File
 from mutagen.id3 import ID3, APIC
 from PIL import Image, ImageDraw, ImageTk
@@ -23,7 +24,7 @@ from PIL import Image, ImageDraw, ImageTk
 class C:
     BG = "#1C1C1E"          # main content
     SIDEBAR = "#262628"
-    BAR = "#2C2C2E"         # bottom player bar
+    BAR = "#2C2C2E"         # bottom player bar / dialogs
     PILL = "#1E1E20"        # now-playing pill
     FIELD = "#3A3A3C"       # search field, secondary buttons
     ROW_ALT = "#212123"
@@ -34,7 +35,11 @@ class C:
     SUB = "#8E8E93"
     DIM = "#636366"
     ACCENT = "#FA243C"      # Apple Music red
+    ACCENT_HOVER = "#E01F35"
+    DISABLED = "#4A4A4C"
 
+
+ART = 188                   # size of the album-art pane in the sidebar
 
 if sys.platform == "darwin":
     FONT = ".AppleSystemUIFont"
@@ -46,6 +51,10 @@ else:
 
 def F(size, weight="normal"):
     return (FONT, size, weight)
+
+
+def ellipsize(text, n):
+    return text if len(text) <= n else text[: n - 1].rstrip() + "…"
 
 
 # ============================================================
@@ -115,6 +124,25 @@ def draw_icon(name, size, color):
         d.rounded_rectangle((S * .08, S * .20, S * .42, S * .42), radius=int(S * .05), fill=color)
         d.rounded_rectangle((S * .08, S * .30, S * .92, S * .80), radius=int(S * .07), fill=color)
 
+    elif name == "plus":
+        d.line([p(.50, .18), p(.50, .82)], fill=color, width=lw)
+        d.line([p(.18, .50), p(.82, .50)], fill=color, width=lw)
+
+    elif name == "download":
+        d.line([p(.50, .12), p(.50, .54)], fill=color, width=lw)
+        d.polygon([p(.26, .42), p(.74, .42), p(.50, .70)], fill=color)
+        d.line([p(.16, .64), p(.16, .86), p(.84, .86), p(.84, .64)], fill=color, width=lw, joint="curve")
+
+    elif name == "playlist":
+        for y in (.26, .46, .66):
+            d.line([p(.10, y), p(.58, y)], fill=color, width=lw)
+        d.ellipse((S * .54, S * .62, S * .76, S * .82), fill=color)
+        d.rectangle((S * .70, S * .28, S * .76, S * .72), fill=color)
+        d.polygon([p(.76, .28), p(.94, .36), p(.94, .46), p(.76, .38)], fill=color)
+
+    elif name == "check":
+        d.line([p(.18, .52), p(.42, .76), p(.82, .26)], fill=color, width=int(lw * 1.3), joint="curve")
+
     elif name.startswith("vol"):
         d.polygon([p(.08, .38), p(.26, .38), p(.48, .18), p(.48, .82), p(.26, .62), p(.08, .62)], fill=color)
         cx, cy = S * .44, S * .5
@@ -152,6 +180,15 @@ def placeholder_art(size, radius):
     note = draw_icon("note", int(size * 0.5), "#6E6E73")
     off = (size - note.size[0]) // 2
     base.alpha_composite(note, dest=(off, off))
+    return base
+
+
+def icon_tile(name, size, fg, bg, radius):
+    """A rounded square with an icon in the middle (used in dialogs)."""
+    base = round_corners(Image.new("RGBA", (size, size), bg), radius)
+    ic = draw_icon(name, int(size * 0.52), fg)
+    off = (size - ic.size[0]) // 2
+    base.alpha_composite(ic, dest=(off, off))
     return base
 
 
@@ -237,6 +274,417 @@ def configure_columns(frame):
     frame.grid_columnconfigure(5, minsize=64)
 
 
+def center_over(win, parent):
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    tk.Wm.geometry(win, f"+{max(x, 0)}+{max(y, 0)}")   # position only; size comes from content
+
+
+# ============================================================
+#  Dialogs
+# ============================================================
+class Dialog(ctk.CTkToplevel):
+    """Apple-style sheet: icon tile, title, message, optional text field, two buttons.
+
+    Use Dialog.ask(app, ...) - it blocks and returns:
+      * the typed text (field=True), or
+      * True (confirm dialogs), or
+      * None / False if cancelled.
+    """
+
+    def __init__(self, app, title, message="", icon=None, field=False, placeholder="",
+                 initial="", confirm="OK", cancel="Cancel", validate=None):
+        super().__init__(app, fg_color=C.BAR)
+        self.app = app
+        self.result = None
+        self.entry = None
+        self.error_label = None
+        self._validate = validate
+
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=26, pady=(26, 22))
+
+        top = ctk.CTkFrame(body, fg_color="transparent")
+        top.pack(fill="x")
+        if icon:
+            ctk.CTkLabel(top, text="", image=app.tile(icon, 64), width=64, height=64).pack(
+                side="left", anchor="n", padx=(0, 16))
+        text = ctk.CTkFrame(top, fg_color="transparent")
+        text.pack(side="left", anchor="n")
+        ctk.CTkLabel(text, text=title, font=F(18, "bold"), text_color=C.TEXT,
+                     anchor="w", justify="left", wraplength=300).pack(anchor="w")
+        if message:
+            ctk.CTkLabel(text, text=message, font=F(13), text_color=C.SUB,
+                         anchor="w", justify="left", wraplength=300).pack(anchor="w", pady=(4, 0))
+
+        if field:
+            self.entry = ctk.CTkEntry(
+                body, width=340, height=38, corner_radius=8, border_width=0, fg_color=C.FIELD,
+                text_color=C.TEXT, placeholder_text=placeholder, placeholder_text_color=C.SUB, font=F(14))
+            self.entry.pack(fill="x", pady=(18, 0))
+            if initial:
+                self.entry.insert(0, initial)
+            self.entry.bind("<KeyRelease>", lambda e: self._refresh())
+            self.error_label = ctk.CTkLabel(body, text="", font=F(12), text_color=C.ACCENT,
+                                            anchor="w", height=16)
+            self.error_label.pack(fill="x", pady=(4, 0))
+
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", pady=(14, 0))
+        self.ok_btn = ctk.CTkButton(
+            row, text=confirm, width=110, height=34, corner_radius=8, font=F(14, "bold"),
+            fg_color=C.ACCENT, hover_color=C.ACCENT_HOVER, text_color="white",
+            text_color_disabled=C.SUB, command=self._confirm)
+        self.ok_btn.pack(side="right")
+        if cancel:
+            ctk.CTkButton(
+                row, text=cancel, width=96, height=34, corner_radius=8, font=F(14),
+                fg_color=C.FIELD, hover_color="#4A4A4C", text_color=C.TEXT,
+                command=self._cancel).pack(side="right", padx=(0, 10))
+
+        self.bind("<Return>", lambda e: self._confirm())
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        self._refresh()
+        center_over(self, app)
+        self.after(120, self._activate)
+
+    @classmethod
+    def ask(cls, app, **kw):
+        dlg = cls(app, **kw)
+        app.wait_window(dlg)
+        return dlg.result
+
+    def _activate(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+            if self.entry is not None:
+                self.entry.focus_set()
+                self.entry.select_range(0, "end")
+        except tk.TclError:
+            pass
+
+    def _refresh(self):
+        ok, err = True, ""
+        if self.entry is not None:
+            value = self.entry.get().strip()
+            ok = bool(value)
+            if ok and self._validate:
+                err = self._validate(value) or ""
+                ok = not err
+            self.error_label.configure(text=err)
+        self.ok_btn.configure(state="normal" if ok else "disabled",
+                              fg_color=C.ACCENT if ok else C.DISABLED)
+
+    def _confirm(self):
+        if str(self.ok_btn.cget("state")) == "disabled":
+            return
+        self.result = self.entry.get().strip() if self.entry is not None else True
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class DownloadDialog(ctk.CTkToplevel):
+    """One window for the whole YouTube flow: paste link -> progress -> done / error.
+    It is not modal, so music keeps playing and the player stays usable."""
+
+    def __init__(self, app):
+        super().__init__(app, fg_color=C.BAR)
+        self.app = app
+        self.folder = app.last_folder
+        self.events = queue.Queue()
+        self.cancel_flag = threading.Event()
+        self.running = False
+        self.pb_determinate = False
+        self._last_title = ""
+        self.done_count = 0
+
+        self.title("Download from YouTube")
+        self.resizable(False, False)
+        self.transient(app)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=26, pady=(26, 22))
+
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.pack(fill="x")
+        self.tile_label = ctk.CTkLabel(head, text="", width=64, height=64)
+        self.tile_label.pack(side="left", anchor="n", padx=(0, 16))
+        txt = ctk.CTkFrame(head, fg_color="transparent")
+        txt.pack(side="left", anchor="n")
+        self.head_title = ctk.CTkLabel(txt, text="", font=F(18, "bold"), text_color=C.TEXT,
+                                       anchor="w", justify="left", wraplength=300)
+        self.head_title.pack(anchor="w")
+        self.head_msg = ctk.CTkLabel(txt, text="", font=F(13), text_color=C.SUB,
+                                     anchor="w", justify="left", wraplength=300)
+        self.head_msg.pack(anchor="w", pady=(4, 0))
+
+        self.content = ctk.CTkFrame(body, fg_color="transparent")
+        self.content.pack(fill="x", pady=(18, 0))
+
+        self.show_input()
+        center_over(self, app)
+        self.after(150, self._activate)
+
+    # ---------------- helpers ----------------
+    def _activate(self):
+        try:
+            self.lift()
+            self.focus_force()
+            if getattr(self, "entry", None) is not None and self.entry.winfo_exists():
+                self.entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _clear(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+    def _set_header(self, title, message, icon):
+        self.tile_label.configure(image=self.app.tile(icon, 64))
+        self.head_title.configure(text=title)
+        self.head_msg.configure(text=message)
+
+    def _button_row(self, primary_text, primary_cmd, secondary_text=None, secondary_cmd=None, primary_state="normal"):
+        row = ctk.CTkFrame(self.content, fg_color="transparent")
+        row.pack(fill="x", pady=(16, 0))
+        primary = ctk.CTkButton(
+            row, text=primary_text, width=120, height=34, corner_radius=8, font=F(14, "bold"),
+            fg_color=C.ACCENT if primary_state == "normal" else C.DISABLED,
+            hover_color=C.ACCENT_HOVER, text_color="white", text_color_disabled=C.SUB,
+            state=primary_state, command=primary_cmd)
+        primary.pack(side="right")
+        if secondary_text:
+            ctk.CTkButton(
+                row, text=secondary_text, width=110, height=34, corner_radius=8, font=F(14),
+                fg_color=C.FIELD, hover_color="#4A4A4C", text_color=C.TEXT,
+                command=secondary_cmd).pack(side="right", padx=(0, 10))
+        return primary
+
+    # ---------------- stage 1: paste a link ----------------
+    def show_input(self, error=""):
+        self.running = False
+        self._clear()
+        folder_name = os.path.basename(os.path.normpath(self.folder)) or self.folder
+        self._set_header("Download from YouTube",
+                         f"Saved as MP3 with cover art in “{ellipsize(folder_name, 28)}”.", "download")
+
+        row = ctk.CTkFrame(self.content, fg_color="transparent")
+        row.pack(fill="x")
+        self.entry = ctk.CTkEntry(
+            row, width=290, height=38, corner_radius=8, border_width=0, fg_color=C.FIELD,
+            text_color=C.TEXT, placeholder_text="Paste a YouTube link",
+            placeholder_text_color=C.SUB, font=F(14))
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<KeyRelease>", lambda e: self._refresh_start())
+        self.entry.bind("<Return>", lambda e: self.start())
+        ctk.CTkButton(
+            row, text="Paste", width=64, height=38, corner_radius=8, fg_color=C.FIELD,
+            hover_color="#4A4A4C", text_color=C.ACCENT, font=F(13, "bold"),
+            command=self.paste).pack(side="left", padx=(8, 0))
+
+        self.error_label = ctk.CTkLabel(self.content, text=error, font=F(12), text_color=C.ACCENT,
+                                        anchor="w", justify="left", height=16, wraplength=350)
+        self.error_label.pack(fill="x", pady=(6, 0))
+
+        self.start_btn = self._button_row("Download", self.start, "Cancel", self.close, primary_state="disabled")
+        self.after(100, lambda: self.entry.focus_set() if self.entry.winfo_exists() else None)
+
+    def _refresh_start(self):
+        has_text = bool(self.entry.get().strip())
+        self.start_btn.configure(state="normal" if has_text else "disabled",
+                                 fg_color=C.ACCENT if has_text else C.DISABLED)
+
+    def paste(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            return
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+        self._refresh_start()
+
+    def start(self):
+        url = self.entry.get().strip()
+        if not url:
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            self.error_label.configure(text="Paste a full link that starts with https://")
+            return
+        self.cancel_flag.clear()
+        self._last_title = ""
+        self.done_count = 0
+        self.show_progress()
+        self.running = True
+        threading.Thread(target=self._run, args=(url,), daemon=True).start()
+        self._poll()
+
+    # ---------------- stage 2: progress ----------------
+    def show_progress(self):
+        self._clear()
+        self._set_header("Downloading…", "You can keep using the player while this runs.", "download")
+        self.vid_label = ctk.CTkLabel(self.content, text="Getting video info…", font=F(14, "bold"),
+                                      text_color=C.TEXT, anchor="w", justify="left", wraplength=350)
+        self.vid_label.pack(fill="x")
+        self.pb = ctk.CTkProgressBar(self.content, height=6, corner_radius=3, mode="indeterminate",
+                                     progress_color=C.ACCENT, fg_color=C.DISABLED)
+        self.pb.pack(fill="x", pady=(10, 6))
+        self.pb.start()
+        self.pb_determinate = False
+        self.status = ctk.CTkLabel(self.content, text="Starting…", font=F(12), text_color=C.SUB, anchor="w")
+        self.status.pack(fill="x")
+        self._button_row("Cancel", self.close)
+
+    # ---------------- stage 3: finished ----------------
+    def show_done(self):
+        self.running = False
+        self._clear()
+        if self.done_count > 1:
+            msg = f"{self.done_count} songs were added to your library."
+        else:
+            msg = ellipsize(self._last_title, 90) or "Your song is ready."
+        self._set_header("Added to Your Library", msg, "check")
+        row = self._button_row("Done", self.close, "Download Another", self.show_input)
+
+    def show_error(self, message):
+        self.running = False
+        self._clear()
+        self._set_header("Download Failed", ellipsize(message, 230), "download")
+        self._button_row("Try Again", self.show_input, "Close", self.close)
+
+    # ---------------- worker thread ----------------
+    def _run(self, url):
+        q = self.events
+        Cancelled = getattr(yt_dlp.utils, "DownloadCancelled", RuntimeError)
+
+        def prefix_of(info):
+            # "Song 3 of 12 · " for playlists, nothing for a single video
+            idx = info.get("playlist_index")
+            total = info.get("n_entries") or info.get("playlist_count")
+            return f"Song {idx} of {total} · " if idx and total and total > 1 else ""
+
+        def progress_hook(d):
+            if self.cancel_flag.is_set():
+                raise Cancelled("Cancelled")
+            info = d.get("info_dict") or {}
+            prefix = prefix_of(info)
+            if info.get("title"):
+                q.put(("title", info["title"]))
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                done = d.get("downloaded_bytes") or 0
+                if total:
+                    frac = min(done / total, 1.0)
+                    q.put(("progress", frac, f"{prefix}Downloading… {int(frac * 100)}%"))
+            elif d.get("status") == "finished":
+                q.put(("status", f"{prefix}Converting to MP3…"))
+
+        def pp_hook(d):
+            if d.get("status") == "started":
+                prefix = prefix_of(d.get("info_dict") or {})
+                name = d.get("postprocessor", "")
+                q.put(("status", prefix + ("Adding cover art…" if "Thumbnail" in name else "Converting to MP3…")))
+
+        def post_hook(filename):
+            # called once per song after ALL post-processing is finished
+            q.put(("song_done", filename))
+
+        opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(self.folder, "%(title)s.%(ext)s"),
+            "writethumbnail": True,
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
+                {"key": "EmbedThumbnail"},
+            ],
+            "progress_hooks": [progress_hook],
+            "postprocessor_hooks": [pp_hook],
+            "post_hooks": [post_hook],
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            q.put(("done",))
+        except Exception as e:
+            if self.cancel_flag.is_set():
+                q.put(("cancelled",))
+            else:
+                msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).strip()
+                if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
+                    msg = "ffmpeg wasn't found. Install ffmpeg and make sure it's on your PATH."
+                q.put(("error", msg or "Something went wrong."))
+
+    def _poll(self):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            while True:
+                self._handle(self.events.get_nowait())
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        if self.running:
+            self.after(100, self._poll)
+
+    def _handle(self, ev):
+        kind = ev[0]
+        if kind == "title":
+            if ev[1] != self._last_title:
+                self._last_title = ev[1]
+                if self.running:
+                    self.vid_label.configure(text=ellipsize(ev[1], 80))
+        elif kind == "progress" and self.running:
+            if not self.pb_determinate:
+                self.pb.stop()
+                self.pb.configure(mode="determinate")
+                self.pb_determinate = True
+            self.pb.set(ev[1])
+            self.status.configure(text=ev[2])
+        elif kind == "status" and self.running:
+            if self.pb_determinate:
+                self.pb.configure(mode="indeterminate")
+                self.pb.start()
+                self.pb_determinate = False
+            self.status.configure(text=ev[1])
+        elif kind == "song_done":
+            self.done_count += 1
+            self.app.add_downloaded_track(ev[1])
+        elif kind == "done":
+            self.running = False
+            self.app.scan_folder(self.folder)     # final full rescan as a safety net
+            self.show_done()
+        elif kind == "error":
+            self.show_error(ev[1])
+        elif kind == "cancelled":
+            self.running = False
+
+    def close(self):
+        if self.running:
+            self.cancel_flag.set()
+        self.running = False
+        self.destroy()
+
+
 # ============================================================
 #  The player
 # ============================================================
@@ -246,8 +694,8 @@ class MusicPlayer(ctk.CTk):
 
         # 1. Window
         self.title("Music")
-        self.geometry("1120x720")
-        self.minsize(960, 620)
+        self.geometry("1120x740")
+        self.minsize(960, 660)
         self.configure(fg_color=C.BG)
         ctk.set_appearance_mode("dark")
 
@@ -269,7 +717,7 @@ class MusicPlayer(ctk.CTk):
         self.rows = {}              # path -> row widgets
         self.favorites = []
         self.hidden_tracks = []
-        self.playlists = {}
+        self.playlists = {}         # name -> [paths] (order = the order songs were added)
         self.last_folder = ""
         self.settings_file = "player_settings.json"
 
@@ -278,7 +726,7 @@ class MusicPlayer(ctk.CTk):
         self.shuffle = False
         self.repeat = 0             # 0 = off, 1 = all, 2 = one
 
-        self.view = "songs"
+        self.view = "songs"         # "songs" | "favorites" | "playlist_<name>"
         self.search_query = ""
         self.selected = None
         self.loading = False
@@ -287,11 +735,16 @@ class MusicPlayer(ctk.CTk):
         self.scan_queue = queue.Queue()
         self._search_job = None
         self._icon_cache = {}
+        self._tile_cache = {}
+        self._dl_dialog = None
+        self._refresh_job = None
+        self.nav_buttons = {}
+        self.playlist_buttons = {}
 
         # artwork placeholders
         self.ph_thumb = ImageTk.PhotoImage(placeholder_art(40, 5))
         self.ph_small = self._ctk_image(placeholder_art(96, 12), 48)
-        self.ph_big = self._ctk_image(placeholder_art(420, 20), 210)
+        self.ph_big = self._ctk_image(placeholder_art(ART * 2, 20), ART)
         self._art_refs = []
 
         # 3. UI
@@ -322,6 +775,16 @@ class MusicPlayer(ctk.CTk):
             self._icon_cache[key] = self._ctk_image(draw_icon(name, size * 2, color), size)
         return self._icon_cache[key]
 
+    def tile(self, name, size=64):
+        key = (name, size)
+        if key not in self._tile_cache:
+            img = icon_tile(name, size * 2, C.ACCENT, C.FIELD, int(size * 2 * 0.24))
+            self._tile_cache[key] = self._ctk_image(img, size)
+        return self._tile_cache[key]
+
+    def alert(self, title, message, icon="note"):
+        Dialog.ask(self, title=title, message=message, icon=icon, confirm="OK", cancel=None)
+
     # --------------------------------------------------------
     #  Sidebar
     # --------------------------------------------------------
@@ -348,7 +811,6 @@ class MusicPlayer(ctk.CTk):
             sb, text="Library", font=F(12, "bold"), text_color=C.DIM, anchor="w", height=20
         ).pack(fill="x", padx=22, pady=(0, 4))
 
-        self.nav_buttons = {}
         for key, label, ic in (("songs", "Songs", "note"), ("favorites", "Favorites", "heart")):
             btn = ctk.CTkButton(
                 sb, text="  " + label, image=self.icon(ic, 18, C.ACCENT), compound="left",
@@ -359,104 +821,45 @@ class MusicPlayer(ctk.CTk):
             btn.pack(fill="x", padx=12, pady=1)
             self.nav_buttons[key] = btn
 
-        ctk.CTkButton(
-            sb, text="  Open Folder…", image=self.icon("folder", 18, C.ACCENT), compound="left",
-            anchor="w", height=34, corner_radius=8, fg_color="transparent",
-            hover_color="#323234", text_color=C.TEXT, font=F(14),
-            command=self.ask_and_load_folder
-        ).pack(fill="x", padx=12, pady=(14, 1))
+        def action(text, ic, cmd, top=1):
+            ctk.CTkButton(
+                sb, text="  " + text, image=self.icon(ic, 18, C.ACCENT), compound="left",
+                anchor="w", height=34, corner_radius=8, fg_color="transparent",
+                hover_color="#323234", text_color=C.TEXT, font=F(14), command=cmd
+            ).pack(fill="x", padx=12, pady=(top, 1))
 
-        # album art pane at the bottom (the iTunes classic touch)
+        action("Open Folder…", "folder", self.ask_and_load_folder, top=14)
+        action("Download from YouTube", "download", self.open_download)
+
+        # album art pane at the bottom (packed before the playlist list so it always keeps its space)
         self.side_art = ctk.CTkLabel(
-            sb, text="", image=self.ph_big, fg_color="transparent", width=210, height=210
+            sb, text="", image=self.ph_big, fg_color="transparent", width=ART, height=ART
         )
-        self.side_art.pack(side="bottom", pady=(0, 22))
+        self.side_art.pack(side="bottom", pady=(0, 18))
 
-        ctk.CTkLabel(self.sidebar, text="Playlists", font=F(12, "bold"), text_color=C.DIM, anchor="w", height=20).pack(fill="x", padx=22, pady=(15, 4))
-        
+        # playlists section
+        head = ctk.CTkFrame(sb, fg_color="transparent")
+        head.pack(fill="x", padx=(22, 12), pady=(14, 2))
+        ctk.CTkLabel(head, text="Playlists", font=F(12, "bold"), text_color=C.DIM,
+                     anchor="w", height=20).pack(side="left")
         ctk.CTkButton(
-            self.sidebar, text="  + New Playlist", anchor="w", height=30, corner_radius=8, 
-            fg_color="transparent", hover_color="#323234", text_color=C.TEXT, font=F(13),
-            command=self.create_playlist
-        ).pack(fill="x", padx=12, pady=1)
-        
-        self.playlist_container = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent", corner_radius=0, scrollbar_button_color="#3A3A3C")
-        self.playlist_container.pack(fill="both", expand=True, padx=4, pady=4)
+            head, text="", image=self.icon("plus", 14, C.SUB), width=24, height=24, corner_radius=12,
+            fg_color="transparent", hover_color=C.FIELD, command=self.create_playlist
+        ).pack(side="right")
+
+        self.playlist_container = ctk.CTkScrollableFrame(
+            sb, fg_color="transparent", corner_radius=0, height=60,
+            scrollbar_button_color=C.SIDEBAR, scrollbar_button_hover_color="#4A4A4C"
+        )
+        self.playlist_container.pack(fill="both", expand=True, padx=(6, 2), pady=(0, 6))
 
         self.update_nav_highlight()
-
-        self.download_btn = ctk.CTkButton(
-            self.sidebar, text="⬇️ Download from YT", 
-            fg_color="#282828", hover_color="#3E3E3E", font=F(14, "bold"),
-            command=self.ask_and_download
-        )
-        self.download_btn.pack(pady=(0, 10), padx=20, fill="x")
-
-
-    # --------------------------------------------------------
-    #  YouTube Download Logic (With Loading UI)
-    # --------------------------------------------------------
-    def ask_and_download(self):
-        if not self.last_folder:
-            messagebox.showwarning("No Folder", "Please Open Folder first to select where to save songs.")
-            return
-
-        dialog = ctk.CTkInputDialog(text="Paste YouTube Link:", title="Download Music")
-        url = dialog.get_input()
-        
-        if url:
-            self.loading_window = ctk.CTkToplevel(self)
-            self.loading_window.title("Downloading")
-            self.loading_window.geometry("350x180")
-            self.loading_window.resizable(False, False)
-            self.loading_window.attributes("-topmost", True) 
-            self.loading_window.grab_set() 
-            
-            ctk.CTkLabel(self.loading_window, text="Downloading & Converting...", font=F(16, "bold")).pack(pady=(35, 15))
-            
-            self.progress_bar = ctk.CTkProgressBar(self.loading_window, width=250, mode="indeterminate", progress_color="#FA243C")
-            self.progress_bar.pack()
-            self.progress_bar.start() # 让进度条开始来回滚动
-            # --------------------------------------------
-
-            threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
-
-    def _download_worker(self, url):
-        try:
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': os.path.join(self.last_folder, '%(title)s.%(ext)s'),
-                'writethumbnail': True, 
-                'postprocessors': [
-                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '0'},
-                    {'key': 'EmbedThumbnail'}, 
-                ],
-                'quiet': True,
-                'noprogress': True,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            
-            self.after(0, self._download_success)
-        except Exception as e:
-            self.after(0, lambda err=str(e): self._download_error(err))
-
-    def _download_success(self):
-        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
-            self.loading_window.destroy() # 关闭 Loading 窗
-        self.scan_folder(self.last_folder)
-        messagebox.showinfo("Success", "Download & Conversion Complete!")
-
-    def _download_error(self, err_msg):
-        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
-            self.loading_window.destroy()
-        messagebox.showerror("Download Error", err_msg)
-        self.refresh_view()  
 
     def update_nav_highlight(self):
         for key, btn in self.nav_buttons.items():
             btn.configure(fg_color=C.FIELD if key == self.view else "transparent")
+        for name, btn in self.playlist_buttons.items():
+            btn.configure(fg_color=C.FIELD if self.view == f"playlist_{name}" else "transparent")
 
     # --------------------------------------------------------
     #  Library view (header + column titles + song rows)
@@ -609,17 +1012,13 @@ class MusicPlayer(ctk.CTk):
                 self.volume = float(data.get("volume", 0.8))
                 self.shuffle = bool(data.get("shuffle", False))
                 self.repeat = int(data.get("repeat", 0))
-                # --- 核心读取：获取上次保存的歌单 ---
-                self.playlists = data.get("playlists", {}) 
+                self.playlists = {k: list(v) for k, v in data.get("playlists", {}).items()}
             except Exception:
                 pass
 
         self.apply_volume(self.volume)
         self.update_mode_buttons()
-        
-        # --- 核心UI渲染：程序一启动就把歌单刷到左侧边栏 ---
-        if hasattr(self, "refresh_sidebar_playlists"):
-            self.refresh_sidebar_playlists()
+        self.refresh_sidebar_playlists()
 
         if self.last_folder and os.path.isdir(self.last_folder):
             self.scan_folder(self.last_folder)
@@ -635,8 +1034,7 @@ class MusicPlayer(ctk.CTk):
                 "volume": self.volume,
                 "shuffle": self.shuffle,
                 "repeat": self.repeat,
-                # --- 核心保存：把当前所有的歌单写进 JSON 文件存进硬盘 ---
-                "playlists": getattr(self, "playlists", {}),
+                "playlists": self.playlists,
             }
             with open(self.settings_file, "w") as f:
                 json.dump(data, f)
@@ -695,6 +1093,44 @@ class MusicPlayer(ctk.CTk):
         self.after(100, self._poll_scan)
 
     # --------------------------------------------------------
+    #  YouTube download
+    # --------------------------------------------------------
+    def add_downloaded_track(self, filename):
+        """Add one freshly downloaded song to the library without a full rescan."""
+        path = os.path.join(self.folder_for_downloads(), os.path.basename(filename))
+        if not os.path.isfile(path) or path in self.track_map or path in self.hidden_tracks:
+            return
+        track = read_track_info(path)
+        self.tracks.append(track)
+        self.tracks.sort(key=lambda t: os.path.basename(t["path"]).lower())
+        self.track_map[path] = track
+        # re-render at most once every ~1.5 s so big playlists don't make the list flicker
+        if self._refresh_job is None:
+            self._refresh_job = self.after(1500, self._flush_refresh)
+
+    def folder_for_downloads(self):
+        return self.last_folder
+
+    def _flush_refresh(self):
+        self._refresh_job = None
+        if not self.loading:
+            self.refresh_view()
+
+    def open_download(self):
+        if not self.last_folder or not os.path.isdir(self.last_folder):
+            self.alert("Choose a Folder First",
+                       "Open the folder you want to save songs into, then try again.", icon="folder")
+            return
+        try:
+            if self._dl_dialog is not None and self._dl_dialog.winfo_exists():
+                self._dl_dialog.lift()
+                self._dl_dialog.focus_force()
+                return
+        except tk.TclError:
+            pass
+        self._dl_dialog = DownloadDialog(self)
+
+    # --------------------------------------------------------
     #  Views, search and rendering
     # --------------------------------------------------------
     def set_view(self, key):
@@ -718,45 +1154,42 @@ class MusicPlayer(ctk.CTk):
             self.refresh_view(reset_scroll=True)
         self.focus_set()
 
+    @staticmethod
+    def _haystack(t):
+        """Title + artist + album converted to simplified Chinese once, so
+        traditional and simplified searches match each other."""
+        h = t.get("_hay")
+        if h is None:
+            h = zhconv.convert(f'{t["title"]}\n{t["artist"]}\n{t["album"]}'.lower(), "zh-hans")
+            t["_hay"] = h
+        return h
+
+    def current_playlist(self):
+        return self.view[len("playlist_"):] if self.view.startswith("playlist_") else None
+
     def refresh_view(self, reset_scroll=False):
         items = self.tracks
-        
-        # 1. 列表内容过滤 (Favorites 和 Playlist 的逻辑完全独立)
+        pl = self.current_playlist()
+
         if self.view == "favorites":
             items = [t for t in items if t["path"] in self.favorites]
-        elif self.view.startswith("playlist_"):
-            p_name = self.view.replace("playlist_", "", 1)
-            items = [t for t in items if t["path"] in self.playlists.get(p_name, [])]
-            
-        # 2. 搜索过滤 (支持简繁体无缝互搜)
+        elif pl is not None:
+            items = [self.track_map[p] for p in self.playlists.get(pl, []) if p in self.track_map]
+
         q = self.search_query.lower()
         if q:
-            # 将用户的搜索词在后台转成简体
-            q_simp = zhconv.convert(q, 'zh-hans')
-            
-            filtered_items = []
-            for t in items:
-                # 把歌曲的标题、歌手、专辑也都暂时转成简体来进行匹配判断
-                title_simp = zhconv.convert(t["title"].lower(), 'zh-hans')
-                artist_simp = zhconv.convert(t["artist"].lower(), 'zh-hans')
-                album_simp = zhconv.convert(t["album"].lower(), 'zh-hans')
-                
-                # 只要有一项匹配中，就显示这首歌
-                if q_simp in title_simp or q_simp in artist_simp or q_simp in album_simp:
-                    filtered_items.append(t)
-            
-            items = filtered_items
+            q_simp = zhconv.convert(q, "zh-hans")
+            items = [t for t in items if q_simp in self._haystack(t)]
 
         self.queue = [t["path"] for t in items]
-        
-        # 3. 动态修改页面大标题
+
         if self.view == "favorites":
             self.title_label.configure(text="Favorites")
-        elif self.view.startswith("playlist_"):
-            self.title_label.configure(text=self.view.replace("playlist_", "", 1))
+        elif pl is not None:
+            self.title_label.configure(text=ellipsize(pl, 26))
         else:
             self.title_label.configure(text="Songs")
-            
+
         self.subtitle_label.configure(text="Loading…" if self.loading else summarize(items))
         self.render_rows(items)
         if reset_scroll:
@@ -789,24 +1222,29 @@ class MusicPlayer(ctk.CTk):
             self.after(5, lambda: self._render_batch(items, end, token))
 
     def show_empty_state(self):
+        icon_name = "note"
         if self.loading:
             title, msg, button = "Loading Music…", "Reading your library.", False
         elif self.search_query:
             title, msg, button = "No Results", f"Nothing matches “{self.search_query}”.", False
+        elif self.current_playlist() is not None:
+            icon_name = "playlist"
+            title, msg, button = "Empty Playlist", "Right-click a song and choose Add to Playlist.", False
         elif self.view == "favorites":
+            icon_name = "heart"
             title, msg, button = "No Favorites", "Click the heart next to a song, or right-click it, to add it here.", False
         else:
             title, msg, button = "No Music", "Choose a folder to build your library.", True
 
         box = ctk.CTkFrame(self.list_frame, fg_color="transparent")
         box.pack(pady=(110, 0))
-        ctk.CTkLabel(box, text="", image=self.icon("note", 44, C.DIM)).pack(pady=(0, 10))
+        ctk.CTkLabel(box, text="", image=self.icon(icon_name, 44, C.DIM)).pack(pady=(0, 10))
         ctk.CTkLabel(box, text=title, font=F(20, "bold"), text_color=C.TEXT).pack()
         ctk.CTkLabel(box, text=msg, font=F(13), text_color=C.SUB).pack(pady=(4, 16))
         if button:
             ctk.CTkButton(
                 box, text="Open Folder…", width=140, height=36, corner_radius=8,
-                fg_color=C.ACCENT, hover_color="#E01F35", text_color="white",
+                fg_color=C.ACCENT, hover_color=C.ACCENT_HOVER, text_color="white",
                 font=F(14, "bold"), command=self.ask_and_load_folder
             ).pack()
 
@@ -935,14 +1373,17 @@ class MusicPlayer(ctk.CTk):
         self.subtitle_label.configure(text=summarize([self.track_map[p] for p in self.queue if p in self.track_map]))
 
     # --------------------------------------------------------
-    #  Context menu / favorites / remove
+    #  Context menus
     # --------------------------------------------------------
-    def show_context_menu(self, event, path):
-        self.select_row(path)
-        menu = tk.Menu(
-            self, tearoff=0, bg="#2C2C2E", fg="white", bd=0,
+    def _menu(self, parent=None):
+        return tk.Menu(
+            parent or self, tearoff=0, bg="#2C2C2E", fg="white", bd=0,
             activebackground=C.ACCENT, activeforeground="white", font=F(11)
         )
+
+    def show_context_menu(self, event, path):
+        self.select_row(path)
+        menu = self._menu()
         menu.add_command(label="Play", command=lambda: self.play_track(path))
         menu.add_separator()
         if path in self.favorites:
@@ -951,13 +1392,34 @@ class MusicPlayer(ctk.CTk):
             menu.add_command(label="Add to Favorites", command=lambda: self.toggle_favorite(path))
         menu.add_separator()
 
+        # Add to Playlist >
+        sub = self._menu(menu)
+        for name, songs in self.playlists.items():
+            label = ("✓  " if path in songs else "     ") + ellipsize(name, 28)
+            sub.add_command(label=label, command=lambda n=name: self.add_to_playlist(path, n))
         if self.playlists:
-            playlist_menu = tk.Menu(menu, tearoff=0, bg="#2C2C2E", fg="white", activebackground=C.ACCENT, font=F(11))
-            for p_name in self.playlists.keys():
-                playlist_menu.add_command(label=p_name, command=lambda n=p_name: self.add_to_playlist(path, n))
-            menu.add_cascade(label="Add to Playlist ➔", menu=playlist_menu)
-        # ------------------------------------------
+            sub.add_separator()
+        sub.add_command(label="New Playlist…", command=lambda: self.create_playlist(add_path=path))
+        menu.add_cascade(label="Add to Playlist", menu=sub)
+
+        pl = self.current_playlist()
+        if pl is not None:
+            menu.add_command(label="Remove from This Playlist",
+                             command=lambda: self.remove_from_playlist(path, pl))
+
+        menu.add_separator()
         menu.add_command(label="Remove from Library", command=lambda: self.remove_track_from_app(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def show_playlist_menu(self, event, name):
+        menu = self._menu()
+        menu.add_command(label="Play", command=lambda: self.play_playlist(name))
+        menu.add_separator()
+        menu.add_command(label="Rename…", command=lambda: self.rename_playlist(name))
+        menu.add_command(label="Delete", command=lambda: self.delete_playlist(name))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -976,10 +1438,11 @@ class MusicPlayer(ctk.CTk):
     def remove_track_from_app(self, path):
         track = self.track_map.get(path)
         name = track["title"] if track else os.path.basename(path)
-        confirm = messagebox.askyesno(
-            "Remove from Library",
-            f"Remove this song from your library?\n(The file on your PC will NOT be deleted)\n\n{name}"
-        )
+        confirm = Dialog.ask(
+            self, title="Remove from Library?",
+            message=f"“{ellipsize(name, 60)}” will be removed from your library. "
+                    "The file on your PC will not be deleted.",
+            icon="note", confirm="Remove")
         if not confirm:
             return
 
@@ -992,6 +1455,9 @@ class MusicPlayer(ctk.CTk):
             self.hidden_tracks.append(path)
         if path in self.favorites:
             self.favorites.remove(path)
+        for songs in self.playlists.values():
+            if path in songs:
+                songs.remove(path)
         self.tracks = [t for t in self.tracks if t["path"] != path]
         self.track_map.pop(path, None)
         if self.selected == path:
@@ -999,6 +1465,113 @@ class MusicPlayer(ctk.CTk):
 
         self.drop_row(path)
         self.save_session()
+
+    # --------------------------------------------------------
+    #  Playlists
+    # --------------------------------------------------------
+    def _name_error(self, value, ignore=None):
+        taken = {n.lower() for n in self.playlists if n != ignore}
+        if value.lower() in taken:
+            return "You already have a playlist with this name."
+        if len(value) > 60:
+            return "That name is too long."
+        return None
+
+    def create_playlist(self, add_path=None):
+        name = Dialog.ask(
+            self, title="New Playlist", message="Give your playlist a name.",
+            icon="playlist", field=True, placeholder="Playlist name", confirm="Create",
+            validate=self._name_error)
+        if not name:
+            return
+        self.playlists[name] = [add_path] if add_path else []
+        self.save_session()
+        self.refresh_sidebar_playlists()
+        if add_path is None:
+            self.set_playlist_view(name)     # opened from the sidebar: jump straight into it
+
+    def rename_playlist(self, old):
+        new = Dialog.ask(
+            self, title="Rename Playlist", icon="playlist", field=True, initial=old,
+            placeholder="Playlist name", confirm="Rename",
+            validate=lambda v: self._name_error(v, ignore=old))
+        if not new or new == old:
+            return
+        self.playlists = {(new if k == old else k): v for k, v in self.playlists.items()}
+        if self.view == f"playlist_{old}":
+            self.view = f"playlist_{new}"
+        self.save_session()
+        self.refresh_sidebar_playlists()
+        self.refresh_view()
+
+    def delete_playlist(self, name):
+        confirm = Dialog.ask(
+            self, title=f"Delete “{ellipsize(name, 30)}”?",
+            message="The songs stay in your library.", icon="playlist", confirm="Delete")
+        if not confirm:
+            return
+        self.playlists.pop(name, None)
+        was_open = self.view == f"playlist_{name}"
+        self.save_session()
+        self.refresh_sidebar_playlists()
+        if was_open:
+            self.set_view("songs")
+
+    def add_to_playlist(self, path, name):
+        songs = self.playlists.get(name)
+        if songs is None or path in songs:
+            return
+        songs.append(path)
+        self.save_session()
+        if self.view == f"playlist_{name}":
+            self.refresh_view()
+
+    def remove_from_playlist(self, path, name):
+        songs = self.playlists.get(name, [])
+        if path in songs:
+            songs.remove(path)
+            self.save_session()
+            self.drop_row(path)
+
+    def play_playlist(self, name):
+        self.set_playlist_view(name)
+        if self.queue:
+            self.play_track(self.queue[0])
+
+    def set_playlist_view(self, name):
+        self.view = f"playlist_{name}"
+        self.update_nav_highlight()
+        self.refresh_view(reset_scroll=True)
+
+    def refresh_sidebar_playlists(self):
+        for w in self.playlist_container.winfo_children():
+            w.destroy()
+        self.playlist_buttons = {}
+
+        if not self.playlists:
+            ctk.CTkLabel(
+                self.playlist_container, text="No playlists yet.\nClick + to create one.",
+                font=F(12), text_color=C.DIM, justify="left", anchor="w"
+            ).pack(fill="x", padx=14, pady=(6, 0))
+            return
+
+        right_click = ["<Button-3>"]
+        if sys.platform == "darwin":
+            right_click += ["<Button-2>", "<Control-Button-1>"]
+
+        for name in self.playlists:
+            btn = ctk.CTkButton(
+                self.playlist_container, text="  " + ellipsize(name, 20),
+                image=self.icon("playlist", 18, C.ACCENT), compound="left", anchor="w",
+                height=32, corner_radius=8,
+                fg_color=C.FIELD if self.view == f"playlist_{name}" else "transparent",
+                hover_color="#323234", text_color=C.TEXT, font=F(14),
+                command=lambda n=name: self.set_playlist_view(n)
+            )
+            btn.pack(fill="x", padx=6, pady=1)
+            for seq in right_click:
+                btn.bind(seq, lambda e, n=name: self.show_playlist_menu(e, n))
+            self.playlist_buttons[name] = btn
 
     # --------------------------------------------------------
     #  Now playing display
@@ -1016,7 +1589,7 @@ class MusicPlayer(ctk.CTk):
             try:
                 src = Image.open(io.BytesIO(data))
                 small = self._ctk_image(round_corners(square(src, 96), 12), 48)
-                big = self._ctk_image(round_corners(square(src, 420), 20), 210)
+                big = self._ctk_image(round_corners(square(src, ART * 2), 20), ART)
             except Exception:
                 pass
         self._art_refs = [small, big]
@@ -1044,7 +1617,7 @@ class MusicPlayer(ctk.CTk):
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
         except pygame.error as e:
-            messagebox.showerror("Can't play this song", f"{os.path.basename(path)}\n\n{e}")
+            self.alert("Can't Play This Song", f"{os.path.basename(path)}\n\n{e}")
             return
 
         old, self.current_file = self.current_file, path
@@ -1237,59 +1810,6 @@ class MusicPlayer(ctk.CTk):
             pass
         self.play_pause_track()
         return "break"
-
-    # ========================================================
-    #  Playlist Core Logic
-    # ========================================================
-    def create_playlist(self):
-        dialog = ctk.CTkInputDialog(text="Enter Playlist Name:", title="New Playlist")
-        name = dialog.get_input()
-        if name and name.strip():
-            name = name.strip()
-            if name in self.playlists:
-                messagebox.showwarning("Exists", "Playlist already exists!")
-                return
-            self.playlists[name] = []
-            self.save_session()
-            self.refresh_sidebar_playlists()
-
-    def add_to_playlist(self, path, playlist_name):
-        if path not in self.playlists[playlist_name]:
-            self.playlists[playlist_name].append(path)
-            self.save_session()
-            # 如果用户正停留在该歌单界面，即时刷新显示新歌
-            if self.view == f"playlist_{playlist_name}":
-                self.refresh_view(reset_scroll=False)
-
-    def refresh_sidebar_playlists(self):
-        if not hasattr(self, "playlist_container"): return
-        for w in self.playlist_container.winfo_children():
-            w.destroy()
-            
-        for p_name in self.playlists.keys():
-            btn = ctk.CTkButton(
-                self.playlist_container, text=f"🎵  {p_name}", anchor="w", height=30, corner_radius=8,
-                fg_color=C.FIELD if self.view == f"playlist_{p_name}" else "transparent",
-                hover_color="#323234", text_color=C.TEXT, font=F(13),
-                command=lambda n=p_name: self.set_playlist_view(n)
-            )
-            btn.pack(fill="x", padx=8, pady=1)
-            # 隐藏彩蛋：对着左侧的歌单名字 Right-Click 可以删除整个歌单
-            btn.bind("<Button-3>", lambda e, n=p_name: self.delete_playlist(n))
-
-    def set_playlist_view(self, playlist_name):
-        self.view = f"playlist_{playlist_name}"
-        self.update_nav_highlight()
-        self.refresh_sidebar_playlists()
-        self.refresh_view(reset_scroll=True)
-
-    def delete_playlist(self, playlist_name):
-        if messagebox.askyesno("Delete Playlist", f"Are you sure you want to delete playlist '{playlist_name}'?"):
-            del self.playlists[playlist_name]
-            if self.view == f"playlist_{playlist_name}":
-                self.set_view("songs")
-            self.save_session()
-            self.refresh_sidebar_playlists()
 
 
 if __name__ == "__main__":
