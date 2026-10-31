@@ -30,8 +30,8 @@ Linux: sudo apt install ffmpeg
 
 Clone the repository:
 
-git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY_NAME.git
-cd YOUR_REPOSITORY_NAME
+git clone [https://github.com/user223814/MBBmusicplayer.git](https://github.com/user223814/MBBmusicplayer.git)
+   cd MBBmusicplayer
 
 
 Install the required Python packages:
