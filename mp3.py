@@ -617,6 +617,7 @@ class DownloadDialog(ctk.CTkToplevel):
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
+            "ignoreerrors": True,
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
