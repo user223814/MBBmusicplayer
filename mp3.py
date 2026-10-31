@@ -379,8 +379,9 @@ class MusicPlayer(ctk.CTk):
         )
         self.download_btn.pack(pady=(0, 10), padx=20, fill="x")
 
+
     # --------------------------------------------------------
-    #  YouTube Download Logic
+    #  YouTube Download Logic (With Loading UI)
     # --------------------------------------------------------
     def ask_and_download(self):
         if not self.last_folder:
@@ -391,25 +392,31 @@ class MusicPlayer(ctk.CTk):
         url = dialog.get_input()
         
         if url:
-            self.subtitle_label.configure(text="Downloading & Converting... Please wait.")
+            self.loading_window = ctk.CTkToplevel(self)
+            self.loading_window.title("Downloading")
+            self.loading_window.geometry("350x180")
+            self.loading_window.resizable(False, False)
+            self.loading_window.attributes("-topmost", True) 
+            self.loading_window.grab_set() 
+            
+            ctk.CTkLabel(self.loading_window, text="Downloading & Converting...", font=F(16, "bold")).pack(pady=(35, 15))
+            
+            self.progress_bar = ctk.CTkProgressBar(self.loading_window, width=250, mode="indeterminate", progress_color="#FA243C")
+            self.progress_bar.pack()
+            self.progress_bar.start() # 让进度条开始来回滚动
+            # --------------------------------------------
+
             threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
 
     def _download_worker(self, url):
         try:
-            # 升级版 yt-dlp 配置：自动抓取并嵌入封面
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': os.path.join(self.last_folder, '%(title)s.%(ext)s'),
-                'writethumbnail': True,  # 核心1：强制下载视频的封面图
+                'writethumbnail': True, 
                 'postprocessors': [
-                    {
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '0',
-                    },
-                    {
-                        'key': 'EmbedThumbnail',  # 核心2：利用 FFmpeg 把下载的图片强行压进 MP3 文件内部
-                    },
+                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '0'},
+                    {'key': 'EmbedThumbnail'}, 
                 ],
                 'quiet': True,
                 'noprogress': True,
@@ -418,11 +425,21 @@ class MusicPlayer(ctk.CTk):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
             
-            self.after(0, lambda: self.scan_folder(self.last_folder))
-            self.after(0, lambda: messagebox.showinfo("Success", "Download & Conversion Complete!"))
+            self.after(0, self._download_success)
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Download Error", str(e)))
-            self.after(0, lambda: self.refresh_view())  
+            self.after(0, lambda err=str(e): self._download_error(err))
+
+    def _download_success(self):
+        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
+            self.loading_window.destroy() # 关闭 Loading 窗
+        self.scan_folder(self.last_folder)
+        messagebox.showinfo("Success", "Download & Conversion Complete!")
+
+    def _download_error(self, err_msg):
+        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
+            self.loading_window.destroy()
+        messagebox.showerror("Download Error", err_msg)
+        self.refresh_view()  
 
     def update_nav_highlight(self):
         for key, btn in self.nav_buttons.items():
