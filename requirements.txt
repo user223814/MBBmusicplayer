@@ -1,0 +1,6 @@
+customtkinter
+pygame
+mutagen
+Pillow
+yt-dlp
+zhconv
