@@ -609,6 +609,7 @@ class DownloadDialog(ctk.CTkToplevel):
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
                 {"key": "EmbedThumbnail"},
+                {"key": "FFmpegMetadata"}, 
             ],
             "progress_hooks": [progress_hook],
             "postprocessor_hooks": [pp_hook],
@@ -717,10 +718,9 @@ class MusicPlayer(ctk.CTk):
         self.rows = {}              # path -> row widgets
         self.favorites = []
         self.hidden_tracks = []
-        self.playlists = {}          # 绝对要保留的歌单数据！
+        self.playlists = {}        
         self.last_folder = ""
         
-        # --- 核心升级：动态获取系统的用户数据目录 (跨平台支持) ---
         if sys.platform == "win32":
             base_dir = os.getenv("APPDATA")
         elif sys.platform == "darwin":
@@ -728,9 +728,8 @@ class MusicPlayer(ctk.CTk):
         else:
             base_dir = os.path.expanduser("~/.config")
             
-        # 为你的 App 创建一个专属文件夹
         self.app_dir = os.path.join(base_dir, "MyMusicPlayer")
-        os.makedirs(self.app_dir, exist_ok=True) # 如果没有这个文件夹，就自动创建
+        os.makedirs(self.app_dir, exist_ok=True) 
         self.settings_file = os.path.join(self.app_dir, "player_settings.json")
         # --------------------------------------------------------
 
